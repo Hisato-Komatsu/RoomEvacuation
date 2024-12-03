@@ -10,15 +10,15 @@ reservoir+LSPI
 3/26 epsilonがepsilon_minよりも小さくなったらepsilon_minに戻すように変更
 4/2 test mode導入
 4/18 exit用のチャンネルの入力重みをdenseにすることを検討...Cut_probのch3を0.0にするコードを作成
+12/2 intrinsic rewardを、単に各マスを訪れた回数に比例した負の値に変更
 """
 import numpy as np
 #import gc
 
-#import matplotlib.pyplot as plt
 import copy
 from PIL import Image, ImageDraw
-from scipy.sparse import csr_matrix, csc_matrix
-from collections import deque
+from scipy.sparse import csr_matrix
+#from collections import deque
 
 
 class Env:
@@ -46,12 +46,12 @@ class Env:
       self.done = False
       self.epsilon_min = self.hyperparameters.epsilon_min
       self.random_closing = self.hyperparameters.random_closing
+
+      self.gamma_intr = self.hyperparameters.gamma_intr
+      self.visit_count = np.zeros((self.width,self.height))
+
       self.test_mode = False
 
-      self.history_length = self.hyperparameters.history_length
-      self.history_weight = ((1.0 + np.arange(self.history_length))**(-1)).reshape(-1,1)
-      self.history_weight = self.history_weight[::-1,:]
-      self.intr_coef = self.hyperparameters.bare_intr_coef*(1.0 - self.hyperparameters.gamma)/self.history_length
 
    def agent_position(self, i_agent):
       if i_agent == self.n_agent-1:
@@ -96,10 +96,9 @@ class Env:
          if self.agents[i_agent].count :
             action=[0,0]
             #self.agents[i_agent]._key_step(self.pos_to_object)
-            self.agents[i_agent].pos_history.append(self.agents[i_agent].pos)
             
             if t >= 1:
-               self.agents[i_agent].reward_past = self.agents[i_agent].reward
+               self.agents[i_agent].reward_past = self.agents[i_agent].reward_extr
                self.agents[i_agent].action_past = action
                self.agents[i_agent].Xi_temp_part0 = copy.deepcopy(self.agents[i_agent].Xi_temp_part1)
 
@@ -109,6 +108,10 @@ class Env:
             self.agents[i_agent].action, self.agents[i_agent].Xi_temp_part1, self.agents[i_agent].Q_temp = self.agents[i_agent].choose_action(state)
             self.agents[i_agent]._step(self.agents[i_agent].action, self.pos_to_object)
             self.move_candidate_number[self.agents[i_agent].new_pos[0]][self.agents[i_agent].new_pos[1]] += 1     
+      
+            #intrinsic reward
+            self.visit_count[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]] += 1.0
+            self.agents[i_agent].reward_intr_past = - self.agents[i_agent].coef_intr*self.visit_count[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]]/np.sum(self.visit_count)
 
       #位置の更新はEnv側で一括管理した方が混線しにくい。
       for i_agent in range(self.n_agent):
@@ -141,27 +144,33 @@ class Env:
             else:
                self.view[self.agents[i_agent].pos[0]][self.agents[i_agent].pos[1]][0] = self.agents[i_agent].color
                self.agents[i_agent].reward_extr = 0.0
-
-            displacement_history = np.stack(self.agents[i_agent].pos_history) - self.agents[i_agent].pos.reshape(1,-1)
-            weighted_displacement_history = displacement_history*self.history_weight[self.history_length-len(self.agents[i_agent].pos_history):,:]
-            self.agents[i_agent].reward_intr = self.intr_coef*np.sum( np.abs(weighted_displacement_history) )
    
-            self.agents[i_agent].reward = self.agents[i_agent].reward_extr + self.agents[i_agent].reward_intr
             self.agents[i_agent].total_reward_extr += self.agents[i_agent].reward_extr
-            self.agents[i_agent].total_reward_intr += self.agents[i_agent].reward_intr
+            self.agents[i_agent].total_reward_intr += self.agents[i_agent].reward_intr_past
             self.agents[i_agent].move_permission = 'no'
 
             #update of memory matrices
             if t >= 1 :
-               Xi_temp = self.agents[i_agent].Xi_temp_part0 - self.agents[i_agent].gamma*self.agents[i_agent].Xi_temp_part1
+               
+               Xi_temp = self.agents[i_agent].Xi_temp_part0 - self.gamma*self.agents[i_agent].Xi_temp_part1
+               Xi_temp_intr = self.agents[i_agent].Xi_temp_part0 - self.gamma_intr*self.agents[i_agent].Xi_temp_part1
+
                if self.experience_sharing == 'on':
                   self.agents[0].reward_list.append(self.agents[i_agent].reward_past)
                   self.agents[0].Xi_temp_list.append(Xi_temp)
+                  self.agents[0].Xi_temp_intr_list.append(Xi_temp_intr)
                   self.agents[0].Xi_temp_p0_list.append(self.agents[i_agent].Xi_temp_part0)
+
+                  self.agents[0].reward_intr_list.append(self.agents[i_agent].reward_intr_past)
+
                elif self.experience_sharing == 'off':
                   self.agents[i_agent].reward_list.append(self.agents[i_agent].reward_past)
                   self.agents[i_agent].Xi_temp_list.append(Xi_temp)
+                  self.agents[i_agent].Xi_temp_intr_list.append(Xi_temp_intr)
                   self.agents[i_agent].Xi_temp_p0_list.append(self.agents[i_agent].Xi_temp_part0)
+
+                  self.agents[i_agent].reward_intr_list.append(self.agents[i_agent].reward_intr_past)
+
 
             if self.agents[i_agent].done:
                #calculation on the last step
@@ -172,47 +181,69 @@ class Env:
 
                action_past = action
                self.agents[i_agent].Xi_temp_part0 = copy.deepcopy(self.agents[i_agent].Xi_temp_part1)
-               self.agents[i_agent].reward_past = self.agents[i_agent].reward
+               self.agents[i_agent].reward_past = self.agents[i_agent].reward_extr
                self.agents[i_agent].action, self.agents[i_agent].Xi_temp_part1, self.agents[i_agent].Q_temp = self.agents[i_agent].choose_action(state)
             
-               Xi_temp = self.agents[i_agent].Xi_temp_part0 - self.agents[i_agent].gamma*self.agents[i_agent].Xi_temp_part1
-   
+               
+               Xi_temp = self.agents[i_agent].Xi_temp_part0 - self.gamma*self.agents[i_agent].Xi_temp_part1
+               Xi_temp_intr = self.agents[i_agent].Xi_temp_part0 - self.gamma_intr*self.agents[i_agent].Xi_temp_part1
+
                if self.experience_sharing == 'on':
                   self.agents[0].reward_list.append(self.agents[i_agent].reward_past)
                   self.agents[0].Xi_temp_list.append(Xi_temp)
+                  self.agents[0].Xi_temp_intr_list.append(Xi_temp_intr)
                   self.agents[0].Xi_temp_p0_list.append(self.agents[i_agent].Xi_temp_part0) 
+
+                  self.agents[0].reward_intr_list.append(0.0)
+
                elif self.experience_sharing == 'off':
                   self.agents[i_agent].reward_list.append(self.agents[i_agent].reward_past)
                   self.agents[i_agent].Xi_temp_list.append(Xi_temp)
+                  self.agents[i_agent].Xi_temp_intr_list.append(Xi_temp_intr)
                   self.agents[i_agent].Xi_temp_p0_list.append(self.agents[i_agent].Xi_temp_part0) 
+
+                  self.agents[i_agent].reward_intr_list.append(0.0)
 
                if self.experience_sharing == 'on':
                   self.agents[0].reward_list.append(0.0)
                   self.agents[0].Xi_temp_list.append(self.agents[i_agent].Xi_temp_part1)
+                  self.agents[0].Xi_temp_intr_list.append(self.agents[i_agent].Xi_temp_part1)
                   self.agents[0].Xi_temp_p0_list.append(self.agents[i_agent].Xi_temp_part1)
+
+                  self.agents[0].reward_intr_list.append(0.0)
+
                elif self.experience_sharing == 'off':
                   self.agents[i_agent].reward_list.append(0.0)
                   self.agents[i_agent].Xi_temp_list.append(self.agents[i_agent].Xi_temp_part1)
+                  self.agents[i_agent].Xi_temp_intr_list.append(self.agents[i_agent].Xi_temp_part1)
                   self.agents[i_agent].Xi_temp_p0_list.append(self.agents[i_agent].Xi_temp_part1)
-                  
-               self.agents[i_agent].count = False
 
+                  self.agents[i_agent].reward_intr_list.append(0.0)
+
+               self.agents[i_agent].count = False
+               
       if not self.test_mode :
          if self.done and self.experience_sharing == 'on':
             self.agents[0].calculate_Wout()
             for i_agent in range(self.n_agent):
                self.agents[i_agent].W_out = copy.deepcopy(self.agents[0].W_out)
+               self.agents[i_agent].W_out_intr = copy.deepcopy(self.agents[0].W_out_intr)
+
          if self.done and self.experience_sharing == 'off':
             for i_agent in range(self.n_agent):
                self.agents[i_agent].calculate_Wout()
 
          if self.done:
             for i_agent in range(self.n_agent):
-               self.agents[i_agent].epsilon = max( self.agents[i_agent].epsilon*self.agents[i_agent].epsilon_decay, self.epsilon_min )
+               self.agents[i_agent].epsilon = max( self.agents[i_agent].epsilon*self.epsilon_decay, self.epsilon_min )
+
       else :
-         self.reward_list = []
-         self.Xi_temp_list = []
-         self.Xi_temp_p0_list = []
+         for i_agent in range(self.n_agent):
+            self.agents[i_agent].Xi_temp_list = []
+            self.agents[i_agent].Xi_temp_intr_list = []
+            self.agents[i_agent].Xi_temp_p0_list = []
+
+            self.agents[i_agent].reward_intr_list = []
 
       #resetting move_candidate_number
       self.move_candidate_number = np.zeros((self.width,self.height)).astype(int)
@@ -279,7 +310,7 @@ class Object:
 #位置の更新はEnv側に運び出した。
 
 class Agent(Object):
-   def __init__(self,x,y,condition, kind, hyperparameters, gamma, epsilon_decay):
+   def __init__(self,x,y,condition, kind, hyperparameters):
       super().__init__(x,y,condition, kind, hyperparameters)
       # building neural net
       self.state_size = self.agent_eyesight_whole*self.agent_eyesight_whole*3
@@ -290,20 +321,22 @@ class Agent(Object):
       self.central_sparsity = self.hyperparameters.central_sparsity
       self.spectral_radius = self.hyperparameters.spectral_radius
       self.lr = self.hyperparameters.leaking_rate
-      self.gamma = gamma
       self.beta = self.hyperparameters.beta # Ridge term 
       self.reservoir_size = self.hyperparameters.reservoir_size
       self.reservoir_output_size = self.reservoir_size + 1
       self.epsilon = self.hyperparameters.epsilon #epsilon-greedy
-      self.epsilon_decay = epsilon_decay
       self.decay_ratio = self.hyperparameters.decay_ratio #decay of memory matrices per one update of W_out
+
+      #intrinsic reward
+      self.coef_intr = self.hyperparameters.coef_intr
+      self.decay_ratio_intr = self.hyperparameters.decay_ratio_intr #decay of memory matrices per one update of W_out_intr
 
       self.reward_list = []
       self.Xi_temp_list = []
+      self.Xi_temp_intr_list = []
       self.Xi_temp_p0_list = []
 
-      self.history_length = self.hyperparameters.history_length
-      self.pos_history = deque([], maxlen=self.history_length)
+      self.reward_intr_list = []
 
       self.total_reward = 0.0
       self.total_reward_extr = 0.0
@@ -322,22 +355,20 @@ class Agent(Object):
       self.W_out = np.random.normal(loc=0.0,scale=0.0,size=(1,self.reservoir_output_size) )
       self.X_esn = np.zeros(self.reservoir_size)
 
+      self.W_out_intr = np.random.normal(loc=0.0,scale=0.0,size=(1,self.reservoir_output_size) )
+
       Cut_prob_W_in_s = np.random.uniform(low=0.0,high=1.0,size=(self.reservoir_size,self.state_size+1))
-      Cut_prob_W_in_a = np.random.uniform(low=0.0,high=1.0,size=(self.reservoir_size,self.action_size))
       Cut_prob_W_res = np.random.uniform(low=0.0,high=1.0,size=(self.reservoir_size,self.reservoir_size))
 
       Cut_prob_mat = self.edge_sparsity * np.ones( (self.agent_eyesight_whole,self.agent_eyesight_whole,3) )
       Cut_prob_mat[self.agent_eyesight_1side-1:self.agent_eyesight_1side+2,self.agent_eyesight_1side-1:self.agent_eyesight_1side+2,:] = self.central_sparsity
-      """
-      Cut_prob_mat[self.agent_eyesight_1side-1:self.agent_eyesight_1side+2,self.agent_eyesight_1side-1:self.agent_eyesight_1side+2,0:2] = self.central_sparsity
-      Cut_prob_mat[:,:,2] = 0.0
-      """
       Cut_prob_mat = np.concatenate( [Cut_prob_mat.reshape(-1), [0.0]] )
 
       for i_1 in range(self.W_in_s.shape[0]):
          for i_2 in range(self.W_in_s.shape[1]):
             if Cut_prob_W_in_s[i_1][i_2] < Cut_prob_mat[i_2] :
                self.W_in_s[i_1][i_2] = 0.00
+
       for i_1 in range(self.W_res.shape[0]):
          for i_2 in range(self.W_res.shape[1]):
             if Cut_prob_W_res[i_1][i_2] < self.sparsity:
@@ -349,9 +380,12 @@ class Agent(Object):
       self.W_in_s = csr_matrix(self.W_in_s)
       self.W_res = csr_matrix(self.W_res)
 
-      #self.XXT = np.zeros((self.reservoir_output_size, self.reservoir_output_size))
       self.XXT = self.beta*np.identity(self.reservoir_output_size)
       self.rX = np.zeros((1, self.reservoir_output_size))
+
+      #intrinsic reward
+      self.XXT_intr = self.beta*np.identity(self.reservoir_output_size) 
+      self.rX_intr = np.zeros((1, self.reservoir_output_size))
 
 
    #methods related with reinforcement learning
@@ -370,14 +404,17 @@ class Agent(Object):
       self.X_esn_tilde = self._ReLU( Input_state + self.W_in_a )
       X_esn_candidates = np.repeat(self.X_esn.reshape(-1,1), self.action_size, axis=1) + self.lr*(self.X_esn_tilde - np.repeat(self.X_esn.reshape(-1,1), self.action_size, axis=1) )
       self.Q = np.dot(self.W_out,np.concatenate([X_esn_candidates, np.ones((1,self.action_size))],axis=0) ).reshape(-1)
+      self.Q_intr = np.dot(self.W_out_intr,np.concatenate([X_esn_candidates, np.ones((1,self.action_size))],axis=0) ).reshape(-1)
+      Q_sum = self.Q + self.Q_intr
 
       p = np.random.uniform(low=0.0,high=1.0)
-      if p < self.epsilon:
+      if p < self.epsilon or np.max(Q_sum) - np.min(Q_sum) < 1.0e-10 :
          action_chosen = np.random.choice(self.action_choice) 
       else:
-         action_chosen = np.argmax(self.Q) 
+         action_chosen = np.argmax(Q_sum) 
       self.X_esn = X_esn_candidates[:,action_chosen]
-      return action_chosen, copy.deepcopy( np.concatenate([self.X_esn,[1.0]]) ), self.Q[action_chosen]  # returns action and corresponding X_res
+
+      return action_chosen, copy.deepcopy( np.concatenate([self.X_esn,[1.0]]) ), self.Q[action_chosen] # returns action and corresponding X_res
 
    def calculate_Wout(self): 
       self.rX += np.dot(np.array(self.reward_list).reshape(1,-1), np.array(self.Xi_temp_p0_list) )
@@ -386,9 +423,22 @@ class Agent(Object):
       self.W_out = np.dot(self.rX,XXTinv)
       self.rX *= self.decay_ratio
       self.XXT *= self.decay_ratio
+
+      self.rX_intr += np.dot(np.array(self.reward_intr_list).reshape(1,-1), np.array(self.Xi_temp_p0_list) )
+      self.XXT_intr += np.dot(np.array(self.Xi_temp_intr_list).T , np.array(self.Xi_temp_p0_list) )
+      XXTinv_intr = np.linalg.inv( self.XXT_intr )
+      self.W_out_intr = np.dot(self.rX_intr,XXTinv_intr)
+      self.rX_intr *= self.decay_ratio_intr
+      self.XXT_intr *= self.decay_ratio_intr
+
       self.reward_list = []
       self.Xi_temp_list = []
+      self.Xi_temp_intr_list = []
       self.Xi_temp_p0_list = []
+
+      self.reward_intr_list = []
+      self.f_targ_list = []
+      self.Xi_RND_temp_list = []
 
    def last_contribution(self, x_dense1):
       X0 = copy.deepcopy(x_dense1).reshape(1,-1) 
@@ -400,96 +450,3 @@ class Agent(Object):
       self.total_reward_intr = 0.0
       self.done = False
       self.count = True
-      self.pos_history = deque([], maxlen=self.history_length)
-
-
-if __name__ == '__main__':
-   hyper = hyperparameters()
-   t_period = hyper.t_period
-   t_observe = hyper.t_observe
-   ep_termination = hyper.ep_termination
-   ep_observe = hyper.ep_observe
-
-   """
-   filename_learning_curve = "LC_" + str(hyper.n_agent) + "pedestrians_classroom_narrowdoor_3ch_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_leaking_" + str(hyper.leaking_rate) + "_specrad_" + str(hyper.spectral_radius) + "_bare_intr_" + str(hyper.bare_intr_coef) + "_Wa_" + str(hyper.sigma_W_in_a) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.txt"
-   filename_intr_learning_curve = "intrLC_" + str(hyper.n_agent) + "pedestrians_classroom_narrowdoor_3ch_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_leaking_" + str(hyper.leaking_rate) + "_specrad_" + str(hyper.spectral_radius) + "_bare_intr_" + str(hyper.bare_intr_coef) + "_Wa_" + str(hyper.sigma_W_in_a) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.txt"
-   filename_density_conf0 = "density_" + str(hyper.n_agent) + "pedestrians_classroom_narrowdoor_3ch_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_leaking_" + str(hyper.leaking_rate) + "_specrad_" + str(hyper.spectral_radius) + "_bare_intr_" + str(hyper.bare_intr_coef) + "_Wa_" + str(hyper.sigma_W_in_a) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.txt"
-
-   file_learning_curve = open(filename_learning_curve, "w")
-   file_intr_learning_curve = open(filename_intr_learning_curve, "w")
-   file_density_conf0 = open(filename_density_conf0, "w")
-
-   filename_density_jx_conf0 = "density_jx_" + str(hyper.n_agent) + "pedestrians_classroom_narrowdoor_3ch_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_leaking_" + str(hyper.leaking_rate) + "_specrad_" + str(hyper.spectral_radius) + "_bare_intr_" + str(hyper.bare_intr_coef) + "_Wa_" + str(hyper.sigma_W_in_a) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.txt"
-   file_density_jx_conf0 = open(filename_density_jx_conf0, "w")
-   """
-
-   t1 = 0
-   myEnv = Env(hyperparameters=hyper)
-   total_reward_list = []
-   mean_count_conf0 = 0.0
-
-   print( myEnv.condition[myEnv.agents[0].pos[0]][myEnv.agents[0].pos[1]] )
-   for n_episode in range (ep_termination):
-      myEnv.done = False
-      for t1 in range (t_period):
-         myEnv._render()
-         if t1 == t_period-1 or all( myEnv.done_agent_list ) :
-            myEnv.done = True
-         if n_episode >= ep_observe and t1 >= t_observe:
-            mean_view_conf0 += myEnv.view
-            var_view_conf0 += myEnv.view*myEnv.view
-            mean_view_vx_conf0 += myEnv.view_vx
-            var_view_vx_conf0 += myEnv.view_vx*myEnv.view_vx
-            mean_count_conf0 += 1.0
-         myEnv._step(t1)
-         if myEnv.done:
-            break
-
-      reward_list = np.zeros(myEnv.n_agent)
-      intr_reward_list = np.zeros(myEnv.n_agent)
-      for i1 in range (myEnv.n_agent):         
-         reward_list[i1] = myEnv.agents[i1].total_reward_extr
-         intr_reward_list[i1] = myEnv.agents[i1].total_reward_intr
-      print( np.max(myEnv.done_time_list), np.mean(myEnv.done_time_list), np.median(myEnv.done_time_list), myEnv.done_agent_list.count(True) )
-      #print(n_episode+1, np.max(myEnv.done_time_list), np.mean(myEnv.done_time_list), np.median(myEnv.done_time_list), myEnv.done_agent_list.count(True), sep="	", file=file_learning_curve)
-      print(n_episode+1, 'th learning ...')
-      if n_episode >= ep_observe:
-         total_reward_list.append(myEnv.agents[0].total_reward)
-      myEnv.reset()
-
-   #file_density_conf0.close()
-   #file_density_jx_conf0.close()
-
-
-   #gif-animation
-   filename_gif1 = "animation_" + str(hyper.n_agent) + "pedestrians_classroom_narrowdoor_3ch_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_leaking_" + str(hyper.leaking_rate) + "_specrad_" + str(hyper.spectral_radius) + "_bare_intr_" + str(hyper.bare_intr_coef) + "_Wa_" + str(hyper.sigma_W_in_a) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try.gif"
-   
-   filename_snap1 = "snapshot_" + str(hyper.n_agent) + "pedestrians_classroom_narrowdoor_3ch_view_" + str(hyper.agent_eyesight_whole) + "_7_3_Nres_" + str(hyper.reservoir_size) + "_leaking_" + str(hyper.leaking_rate) + "_specrad_" + str(hyper.spectral_radius) + "_bare_intr_" + str(hyper.bare_intr_coef) + "_Wa_" + str(hyper.sigma_W_in_a) + "_epsilon_" + str(hyper.epsilon_decay) + "to" + str(hyper.epsilon_min) + "_" + str(seed) + "th_try_t_0.png"
-
-
-   #Test mode : stop learning and fix the door which is closed
-   myEnv.test_mode = True
-   myEnv.random_closing = False
-   print("", file=file_learning_curve)
-   myEnv.reset(ep_termination)
-   myEnv._rendermode_change_to_rgb()
-   myEnv.done = False
-   for n_episode in range (ep_termination,ep_termination+1):
-      for t1 in range (t_period):
-         myEnv._render()
-         myEnv._step(t1)
-         if t1 == t_period-1 or all( myEnv.done_agent_list ) :
-            #t_end = t1+1
-            myEnv._render()
-            break
-      if myEnv.render_mode == 'rgb_array':
-         if n_episode == ep_termination:
-            myEnv.Image_list[0].save(filename_gif1, save_all=True, append_images=myEnv.Image_list[1:], optimize=False, duration=200, loop=0)
-            myEnv.Image_list[0].save(filename_snap1)
-   
-      print( np.max(myEnv.done_time_list), np.mean(myEnv.done_time_list), np.median(myEnv.done_time_list), myEnv.done_agent_list.count(True) )
-      print(n_episode+1, np.max(myEnv.done_time_list), np.mean(myEnv.done_time_list), np.median(myEnv.done_time_list), myEnv.done_agent_list.count(True), sep="	", file=file_learning_curve)
-      myEnv.reset(n_episode+1)
-      myEnv.Image_list = []
-
-   #file_learning_curve.close()
